@@ -9,8 +9,12 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Search common deployment layouts. Your GitHub repository currently keeps
-// index.html and style.css in its root, but public/ is also supported.
+// Render runs this app behind a reverse proxy. Trust the single proxy hop
+// so Express and express-rate-limit can read the visitor IP correctly.
+app.set('trust proxy', 1);
+
+// Search common deployment layouts. The repository may keep index.html and
+// style.css in its root, or place them together in public/, client/, or src/.
 const rootsToCheck = [
   __dirname,
   path.join(__dirname, 'public'),
@@ -62,20 +66,36 @@ console.log('[WOOFLY] Serving website files from: ' + siteDirectory);
 
 app.disable('x-powered-by');
 app.use(helmet({
+  // Firebase Auth popup flows work better when popups are allowed to retain
+  // their opener relationship.
+  crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "https://www.gstatic.com", "https://www.googleapis.com"],
+      scriptSrc: ["'self'", 'https://www.gstatic.com', 'https://www.googleapis.com', 'https://apis.google.com'],
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", 'data:', 'https:', 'blob:'],
-      connectSrc: ["'self'", 'https://*.googleapis.com', 'https://*.firebaseio.com', 'wss://*.firebaseio.com', 'https://identitytoolkit.googleapis.com', 'https://securetoken.googleapis.com'],
-      frameSrc: ['https://*.firebaseapp.com', 'https://accounts.google.com'],
-      fontSrc: ["'self'", 'data:']
+      connectSrc: [
+        "'self'",
+        'https://*.googleapis.com',
+        'https://*.firebaseio.com',
+        'wss://*.firebaseio.com',
+        'https://*.firebasedatabase.app',
+        'wss://*.firebasedatabase.app',
+        'https://identitytoolkit.googleapis.com',
+        'https://securetoken.googleapis.com',
+        'https://firebasestorage.googleapis.com'
+      ],
+      frameSrc: ['https://*.firebaseapp.com', 'https://*.web.app', 'https://accounts.google.com'],
+      fontSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"]
     }
   }
 }));
 
 app.use(express.json({ limit: '20kb' }));
+
 app.use('/api/', rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
@@ -83,16 +103,33 @@ app.use('/api/', rateLimit({
   legacyHeaders: false
 }));
 
-// Firebase Web config is public by design. Never put service-account keys here.
+// Firebase Web config is public by design. Never put service-account private
+// keys, admin credentials, or other server secrets in this response.
+const firebaseEnvironmentKeys = {
+  apiKey: 'FIREBASE_API_KEY',
+  authDomain: 'FIREBASE_AUTH_DOMAIN',
+  projectId: 'FIREBASE_PROJECT_ID',
+  storageBucket: 'FIREBASE_STORAGE_BUCKET',
+  messagingSenderId: 'FIREBASE_MESSAGING_SENDER_ID',
+  appId: 'FIREBASE_APP_ID'
+};
+
 app.get('/api/firebase-config', (req, res) => {
   res.set('Cache-Control', 'no-store');
+
+  const config = {};
+  const missing = [];
+
+  for (const [configName, environmentName] of Object.entries(firebaseEnvironmentKeys)) {
+    const value = process.env[environmentName];
+    config[configName] = value || '';
+    if (!value || !value.trim()) missing.push(environmentName);
+  }
+
   res.json({
-    apiKey: process.env.FIREBASE_API_KEY || '',
-    authDomain: process.env.FIREBASE_AUTH_DOMAIN || '',
-    projectId: process.env.FIREBASE_PROJECT_ID || '',
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
-    messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
-    appId: process.env.FIREBASE_APP_ID || ''
+    ...config,
+    configured: missing.length === 0,
+    missing
   });
 });
 
@@ -113,4 +150,11 @@ app.get('/{*splat}', (req, res) => res.sendFile(indexFile));
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[WOOFLY] Server listening on port ${PORT}`);
+  const missingFirebase = Object.values(firebaseEnvironmentKeys)
+    .filter((key) => !process.env[key] || !process.env[key].trim());
+  if (missingFirebase.length) {
+    console.warn('[WOOFLY] Firebase environment variables missing: ' + missingFirebase.join(', '));
+  } else {
+    console.log('[WOOFLY] Firebase environment variables are present.');
+  }
 });
